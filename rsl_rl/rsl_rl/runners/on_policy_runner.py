@@ -89,6 +89,7 @@ class OnPolicyRunner:
         # initialize writer
         if self.log_dir is not None and self.writer is None:
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+            self._write_custom_scalars_layout()
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
         obs = self.env.get_observations()
@@ -242,5 +243,62 @@ class OnPolicyRunner:
         if device is not None:
             self.alg.actor_critic.to(device)
         return self.alg.actor_critic
+
+    def _write_custom_scalars_layout(self):
+        """Write a Custom Scalars layout for TensorBoard.
+
+        Creates a 'CUSTOM SCALARS' tab with the key metrics grouped and
+        ordered by relevance — independent of alphabetical SCALARS ordering.
+        """
+        layout = {
+            "1 Locomotion": {
+                "Episode Length":        ["Multiline", ["Train/mean_episode_length"]],
+                "Tracking Lin Vel":      ["Multiline", ["Episode/rew_tracking_lin_vel"]],
+                "Tracking Ang Vel":      ["Multiline", ["Episode/rew_tracking_ang_vel"]],
+                "No Fly":               ["Multiline", ["Episode/rew_no_fly"]],
+                "Alive":                ["Multiline", ["Episode/rew_alive"]],
+                "Termination":          ["Multiline", ["Episode/rew_termination"]],
+            },
+            "2 Curricula": {
+                "Penalty Scale":         ["Multiline", ["Episode/curriculum_scales"]],
+                "Max Command X":         ["Multiline", ["Episode/max_command_x"]],
+                "Max Command Yaw":       ["Multiline", ["Episode/max_command_yaw"]],
+                "Disturb Curriculum":    ["Multiline", ["Episode/disturb_curriculum"]],
+            },
+            "3 Penalties": {
+                "DOF Vel Limits":        ["Multiline", ["Episode/rew_dof_vel_limits"]],
+                "DOF Pos Limits":        ["Multiline", ["Episode/rew_dof_pos_limits"]],
+                "Base Height":           ["Multiline", ["Episode/rew_base_height"]],
+                "Orientation Control":   ["Multiline", ["Episode/rew_orientation_control"]],
+                "Stand Still":          ["Multiline", ["Episode/rew_stand_still"]],
+                "Action Rate Lower":     ["Multiline", ["Episode/rew_action_rate_lower"]],
+                "Action Rate Upper":     ["Multiline", ["Episode/rew_action_rate_upper"]],
+                "Torques":              ["Multiline", ["Episode/rew_torques"]],
+            },
+            "4 Stability": {
+                "Feet Contact Forces":   ["Multiline", ["Episode/rew_feet_contact_forces"]],
+                "Feet Slip":            ["Multiline", ["Episode/rew_feet_slip"]],
+                "Feet Stumble":         ["Multiline", ["Episode/rew_feet_stumble"]],
+                "Standing Air":         ["Multiline", ["Episode/rew_standing_air"]],
+                "Hip Deviation":        ["Multiline", ["Episode/rew_hip_deviation"]],
+                "Shoulder Deviation":   ["Multiline", ["Episode/rew_shoulder_deviation"]],
+            },
+            "5 Training": {
+                "Noise Std":            ["Multiline", ["Policy/mean_noise_std"]],
+                "Value Loss":           ["Multiline", ["Loss/value_function"]],
+                "Surrogate Loss":       ["Multiline", ["Loss/surrogate"]],
+                "Sym Loss":             ["Multiline", ["Loss/sym_loss"]],
+                "Priv Recon Loss":      ["Multiline", ["Loss/privileged_recon_loss"]],
+                "Learning Rate":        ["Multiline", ["Loss/learning_rate"]],
+            },
+            "6 Disturb Detail": {
+                "Tracking Disturb":     ["Multiline", ["Episode/tracking_disturb"]],
+                "Tracking Clean":       ["Multiline", ["Episode/tracking_clean"]],
+                "EP Len Disturb":       ["Multiline", ["Episode/ep_len_disturb"]],
+                "EP Len Clean":         ["Multiline", ["Episode/ep_len_clean"]],
+                "Disturb Active Ratio": ["Multiline", ["Episode/disturb_active_ratio"]],
+            },
+        }
+        self.writer.add_custom_scalars(layout)
     
     
