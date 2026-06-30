@@ -1,0 +1,493 @@
+================================================================================
+ARS (Augmented Random Search) — Implementación Caso 4
+Robot Unitree H1-2, Isaac Gym
+Proyecto: Comparación ARS vs PPO para locomoción bípeda
+Fecha de documentación: Junio 2026
+================================================================================
+
+
+1. ALGORITMO ARS — TEORÍA
+================================================================================
+
+Referencia: Mania, Guy, Aurelia & Recht (2018). "Simple random search of static
+linear policies is competitive for reinforcement learning."
+(https://arxiv.org/abs/1803.07055)
+
+El ARS es una búsqueda aleatoria dirigida por gradiente finito para optimizar
+una política LINEAL. No usa redes neuronales — la política es simplemente:
+
+    a = M × normalize(s)
+
+donde M ∈ R^(n_act × n_obs) es la matriz de parámetros, y normalize aplica
+una normalización online de media cero y varianza unitaria (Welford algorithm).
+
+Algoritmo ARS-V2 (el que implementamos):
+─────────────────────────────────────────
+Hiperparámetros: N (pares), b (elite pairs), α (step size), ν (noise std)
+
+Para cada iteración:
+  1. Sampear N perturbaciones δ_i ~ N(0, I) de shape (n_act, n_obs)
+  2. Lanzar 2N rollouts en paralelo:
+       envs  0..N-1  usan política M + ν·δ_i  → retorno r_i^+
+       envs  N..2N-1 usan política M - ν·δ_i  → retorno r_i^-
+  3. Seleccionar los b pares con mayor max(r_i^+, r_i^-) → "elite"
+  4. Calcular gradiente finito:
+       g = (1/b) × Σ_{i∈elite} (r_i^+ - r_i^-) × δ_i
+  5. Normalizar por std de rewards elite:
+       σ_r = std(r_i^+, r_i^-  para i ∈ elite)    ← ARS-V2
+  6. Actualizar:
+       M ← M + (α / (σ_r × ν)) × g
+
+Interpretación geométrica:
+  - δ_i es una dirección aleatoria en el espacio de parámetros de M
+  - (r^+ - r^-) es la derivada direccional de J(M) a lo largo de δ_i
+  - (r^+ - r^-) × δ_i es la proyección del gradiente ∇J sobre δ_i
+  - Promediando b de estos, obtenemos una estimación del gradiente real
+  - Es equivalente a diferencias finitas centradas: dJ/dM ≈ (J(M+νδ)-J(M-νδ))/(2ν)
+
+Relación con PPO:
+  - PPO: gradiente del surrogate loss con value function bootstrap, sample reuse
+  - ARS: gradiente del retorno total del episodio, sin bootstrapping, sin replay
+  - ARS es compatible con reward shaping no diferenciable y retornos esparsos
+  - ARS es más interpretable: M es una matriz (n_act × n_obs) directamente legible
+
+
+2. TAREA: H1-2 HUMANOID WALKING (h1_2walk)
+================================================================================
+
+Robot: Unitree H1-2 (27 DOF) con muñecas fijadas
+DOFs CONTROLADOS: 21 (piernas×12 + torso×1 + hombros+codos×8)
+DOFs FIJADOS: 6 muñecas (wrist_roll, wrist_pitch, wrist_yaw × 2) — mantenidas
+              en default_dof_pos sin control activo
+
+Control: Torque directo (sin PD loop).
+    torques = actions × torque_limits    (acciones normalizadas en [-1, 1])
+  Las 6 muñecas reciben torque=0 (padding).
+
+Terreno: Plano (mesh_type='plane'). Sin curriculum de terreno.
+Objetivo: Caminar hacia adelante con velocidad vx ∈ [0.5, 2.0] m/s.
+          La velocidad vx NO está en el obs (política CIEGA a la velocidad comandada).
+          La política solo recibe señal de recompensa: walk fast = more reward.
+
+Frecuencia de control: 50 Hz (decimation=4, sim_dt=0.005s → dt=0.02s)
+Episodio: máximo 1000 pasos = 20 segundos simulados
+
+
+3. ESPACIO DE OBSERVACIONES
+================================================================================
+
+3.1 Estructura (paper-matched, Mania 2018)
+──────────────────────────────────────────
+El paper usa MuJoCo Humanoid-v1 (14 cuerpos, 17 DOF). Nuestra implementación
+usa Isaac Gym H1-2 (28 cuerpos, 27 DOF → 21 controlados).
+
+Obs del paper (376 dims, M shape = 17×376 = 6,392 params):
+  qpos[2:]      22   posición articular (sin raíz x,y, con z y quaternion)
+  qvel          23   velocidad articular (con velocidades lineares/angulares raíz)
+  cinert        140  14 cuerpos × 10 (masa, com, I_world 6 componentes)
+  cvel           84  14 cuerpos × 6  (velocidad lineal y angular)
+  qfrc_actuator  23  torques actuales en cada joint
+  cfrc_ext       84  14 cuerpos × 6  (fuerza + torque de contacto externo)
+
+Obs nuestra (607 dims, M shape = 21×607 = 12,747 params):
+  ang_vel         3   velocidad angular del base (equivale a qvel[3:6])
+  projected_grav  3   gravedad proyectada al frame del robot (≈ orientación)
+                      REEMPLAZA qpos[3:7] (quaternion) — más limpio porque
+                      elimina el yaw irrelevante para locomoción
+  base_lin_vel    3   velocidad lineal del root body (EXPLÍCITA, paper: qvel[0:3])
+  root_height     1   altura z del root body (EXPLÍCITA, paper: qpos[2])
+  dof_pos        21   posición articular (paper: qpos[7:]) — solo joints ctrl
+  dof_vel        21   velocidad articular (paper: qvel[6:]) — solo joints ctrl
+  torques        21   torques aplicados (paper: qfrc_actuator)
+  contact_forces 84   28 cuerpos × 3 (solo fuerza, sin torque de contacto)
+                      Isaac Gym SOLO expone fuerza neta, NO torque → diferencia
+                      permanente con el paper (su cfrc_ext tiene 6D)
+  body_vels     168   28 cuerpos × 6 (vel lineal + angular por cuerpo, paper: cvel)
+  cinert        280   28 cuerpos × 10 (masa, com_world, I_world upper tri)
+  clock_inputs    2   señales de fase del gait (sin/cos) — EXTRA vs paper
+  ─────────────────
+  TOTAL         607
+
+3.2 Por qué base_lin_vel y root_height son EXPLÍCITOS (no solo implícitos)
+─────────────────────────────────────────────────────────────────────────────
+Ambos valores están también enterrados dentro de los bloques body_vels y cinert:
+  - base_lin_vel: aparece en body_vels[pelvis, 0:3] ≈ posición obs 153:156
+  - root_height: aparece en cinert[pelvis, com_z]   ≈ posición obs 323
+
+Para una política LINEAL a = M × obs_norm, encontrar qué columna de M corresponde
+a "velocidad forward" entre 607 columnas requiere muchas más muestras que tenerlo
+en posición 6 (explícito). Para una red neuronal no importa — para una política
+lineal, la accesibilidad de la información afecta la eficiencia de muestras.
+
+También están duplicados (explícito + implícito) — no es un problema. La política
+lineal aprende a usar el explícito (señal más limpia) y el implícito queda con
+peso ≈ 0, o distribuye el peso entre ambas copias. El resultado es idéntico.
+
+3.3 cinert — implementación
+────────────────────────────
+cinert[body_i] = [masa, com_x, com_y, com_z, Ixx, Iyy, Izz, Ixy, Ixz, Iyz]
+
+donde I_world se computa rotando la inercia local del URDF al frame mundo:
+    R = quat_to_rotmat(rigid_body_states[:, body_i, 3:7])  # Isaac Gym: xyzw
+    I_world = R @ I_local @ R^T
+
+I_local se carga UNA VEZ en init desde la API de Isaac Gym:
+    gym.get_actor_rigid_body_properties(env, actor)
+    p.mass, p.inertia.x.x, p.inertia.x.y, etc.
+
+Si la API no expone p.inertia (fallback):
+    I_local ≈ eye(3) × mass × 0.004    (esfera equivalente de radio ≈ 0.1m)
+
+Pre-normalización CRÍTICA (antes de obs_rms):
+    masa  / 10     pelvis(15kg)→1.5,  wrist(0.1kg)→0.01
+    com   / 1      posiciones ya en metros (rango 0–2m)
+    I6    / 0.1    pelvis I(~0.5)→5,   wrist I(~0.001)→0.01
+
+Sin esta pre-normalización, las 280 dimensiones de cinert llegan a obs_rms
+con rangos 0.0001–15, haciendo que la normalización tarde muchas iteraciones
+en converger → las primeras 50+ iteraciones tienen gradiente = ruido puro →
+ep_len declina → colapso. BUG CRÍTICO encontrado y corregido.
+
+3.4 Ruido de observación
+─────────────────────────
+Afecta solo a las primeras 52 dims (prop), no a torques/contact/body_vels/cinert:
+  ang_vel       : noise_level × ang_vel_scale
+  gravity       : noise_level
+  base_lin_vel  : noise_level × lin_vel_scale
+  root_height   : noise_level × height_scale
+  dof_pos       : noise_level × dof_pos_scale
+  dof_vel       : noise_level × dof_vel_scale
+
+
+4. FUNCIÓN DE RECOMPENSA
+================================================================================
+
+Basada en MuJoCo Humanoid-v1 reward (Mania 2018):
+
+    R = forward_vel + alive_bonus - control_cost - contact_cost
+
+Nuestra implementación (escala por dt=0.02s en el framework):
+
+  _reward_forward_vel():   base_lin_vel[:, 0]          escala = +1.0
+  _reward_alive():         1.0 (constante)              escala = +5.0
+  _reward_control_cost():  sum(actions²)                escala = -0.001
+  _reward_contact_cost():  sum(clip(F/100, -1,1)²)      escala = -0.001
+
+Por paso (dt=0.02s):
+  alive:        0.02 × 5.0 × 1    = +0.10 per step
+  forward(vx):  0.02 × 1.0 × vx   = +0.02×vx per step (vx=1.5→+0.03)
+  ctrl_cost:    0.02 × (-0.001) × Σa² ≈ -0.00002 per step (pequeño)
+  contact_cost: 0.02 × (-0.001) × Σclip² ≈ -0.0010 per step (standing)
+
+Episodio de 1000 pasos a vx=1.5 m/s:
+  Total ≈ 100 (alive) + 30 (forward) - negligible (costs) = ~130
+
+Comparación con paper (sin dt scaling):
+  alive: paper=5.0/step, nosotros=0.1/step → ratio 50×
+  forward: paper=vx/step, nosotros=0.02×vx/step → ratio 50×
+  Los RATIOS entre componentes son iguales → mismo comportamiento relativo.
+  Los rewards más pequeños reducen sigma_r ~50×, que se compensa automáticamente
+  en el update: M += (α / (σ_r × ν)) × g — si σ_r es 50× menor, el effective
+  lr es 50× mayor, restaurando la escala del update.
+
+contact_cost: el paper usa clip(cfrc_ext, -1, 1) con cfrc_ext en Newtons.
+  Nosotros dividimos por 100N antes de clip → clip(F/100, -1, 1).
+  Razón: fuerzas típicas de contacto (300-400N por pie) quedan dentro del rango
+  ±1 después de /100. Sin /100, todas las fuerzas se clipean a 1 siempre y la
+  penalización es solo proporcional al número de cuerpos en contacto, no a la
+  magnitud de la fuerza.
+
+Rewards DESACTIVADOS (todos a 0):
+  tracking_lin_vel, tracking_ang_vel, no_fly, torques, dof_acc,
+  ang_vel_xy, lin_vel_z, feet_contact_forces, feet_slip, feet_stumble,
+  action_rate, base_height, stand_still, orientation_control, etc.
+
+
+5. HIPERPARÁMETROS ARS
+================================================================================
+
+5.1 Configuración actual (post-fixes)
+───────────────────────────────────────
+  num_pairs    (N)  = 230       → num_envs = 460 (correr con --num_envs 460)
+  elite_pairs  (b)  = 76        → top-b/N ≈ 1/3
+  step_size    (α)  = 0.001
+  noise_std    (ν)  = 0.025
+  sigma_r_min       = 1.0       → floor crítico (ver §6.1)
+  max_policy_norm   = 10.0      → hard cap en ||M||_F
+  rollout_steps     = 1000      → un episodio completo por iteración
+  max_iterations    = 3000
+  save_interval     = 200
+  clip_actions      = 1.0
+
+5.2 Eficiencia de muestras por iteración
+──────────────────────────────────────────
+  Env-steps por iter: rollout_steps × 2N = 1000 × 460 = 460,000
+  Updates por iter: 1 (un único gradient step)
+  Parámetros actualizados: 21 × 607 = 12,747
+
+  vs PPO:
+  Env-steps por iter PPO: 24 × 4096 = 98,304
+  Updates por iter PPO: 5 epochs × (98304/4096) minibatches ≈ 25,000 steps
+  Parámetros PPO: ~300,000+ (red neuronal MLP)
+
+  ARS usa ~5× más env-steps por iteración que PPO, para un solo gradient step.
+  PPO hace ~25,000× más updates por iteración. Esta diferencia explica por qué
+  PPO converge mucho más rápido en entornos complejos.
+
+5.3 Efectividad del learning rate
+───────────────────────────────────
+  eff_lr = α / (σ_r × ν)
+
+  Caso nominal (σ_r ≈ 10, α=0.001, ν=0.025):
+    eff_lr = 0.001 / (10 × 0.025) = 0.004
+
+  Paper (Mania 2018, no divide por ν en su fórmula):
+    eff_lr = α / σ_r = 0.015 / 100 = 0.00015
+
+  DIFERENCIA: nosotros dividimos por ν, el paper no. Esto es una diferencia
+  matemática entre implementaciones. Son equivalentes con diferentes α:
+    nuestro α efectivo = paper_α × ν = 0.015 × 0.025 = 0.000375
+    nuestro α = 0.001 ≈ 2.7× el equivalente paper
+
+  El resultado práctico: nuestros updates son algo más grandes que el paper.
+  Con sigma_r_min=1.0, el eff_lr está acotado entre:
+    min: 0.001 / (σ_r_max × 0.025) ≈ variable
+    max (cuando σ_r=1.0): 0.001 / (1.0 × 0.025) = 0.04
+
+
+6. BUGS ENCONTRADOS Y CORREGIDOS
+================================================================================
+
+6.1 Bug: sigma_r blowup (ARS v1, ya corregido)
+────────────────────────────────────────────────
+SÍNTOMA: M_norm creció de 7 → 230 en 939 iters sin mejorar ep_len (48→28 steps).
+         ep_len DECLINÓ mientras M_norm creció.
+
+CAUSA: Todos los episodios terminaban igual de mal (caída en ~30 steps).
+       σ_r = std(elite_rews) ≈ 0.3
+       eff_lr = 0.02 / (0.3 × 0.025) = 2.67 por iter → M crece en dirección
+       aleatoria (ruido) a velocidad 2.67× → robot cae más rápido cada iter.
+       El sistema tiene feedback positivo (peor robot → menos σ_r → más ruido
+       en update → M aún más aleatoria → aún peor).
+
+FIX: sigma_r_min=1.0 en LinearPolicy.update(). Con floor:
+       eff_lr = 0.001 / (1.0 × 0.025) = 0.04 por iter (27× más pequeño)
+     Además max_policy_norm=10.0 impide que M crezca sin límite.
+
+6.2 Bug: cinert cold-start (ya corregido)
+──────────────────────────────────────────
+SÍNTOMA: ep_len declinó de 56 → 30 en 23 iteraciones. Gradient signal ≈ 0
+         (r+ ≈ r- para todos los pares). M_norm creciendo en dirección aleatoria.
+
+CAUSA: Las 280 dimensiones de cinert tienen rangos físicos muy dispares:
+       masa: 0.1–15 kg → magnitud 0.1–15
+       inercia: 0.0001–0.5 kg·m² → magnitud 0.0001–0.5
+       COM: 0–2 m → magnitud 0–2
+
+       obs_rms (Welford) necesita acumular suficientes muestras para estimar
+       correctamente mean/var de cada dimensión. En las primeras 20-50 iters,
+       las vars de cinert son muy pequeñas (poca muestra) → la normalización
+       amplifica ruido → gradient es ruido → robot no mejora → todos los
+       episodios tienen misma duración → σ_r ≈ 0 → sigma_r_min se activa
+       pero el gradiente sigue siendo ruido.
+
+FIX: Pre-normalización con _cinert_scale ANTES de que obs_rms lo vea:
+       masa  / 10    inercia / 0.1    COM / 1
+     Esto garantiza que obs_rms ve valores en rango ~0.01–5 desde el primer
+     paso, y converge en 5-10 iters en lugar de 50+.
+
+6.3 Bug: actions en obs (ya corregido)
+────────────────────────────────────────
+CAUSA: Teníamos las acciones del paso anterior en el obs (21 dims extra).
+       El paper Mania 2018 NO incluye actions en las observaciones.
+       Con control por torque directo, las acciones ya están en "torques"
+       (qfrc_actuator equivalente). Incluirlas doblemente es redundante.
+
+FIX: Eliminadas del obs. WALK_PROP_DIM bajó de 69 → 48 → 52 (con lin_vel+height).
+
+6.4 Bug: base_lin_vel y root_height implícitos (ya corregido)
+───────────────────────────────────────────────────────────────
+CAUSA: Ambos estaban solo en posiciones 153+ de un bloque de 168/280 dims.
+       Para política lineal, "encontrar" la columna correcta requiere más muestras.
+
+FIX: Añadidos explícitamente al inicio del obs prop (posiciones 6:9 y 9:10).
+     Ver §3.2 para explicación detallada.
+
+
+7. DIFERENCIAS PERMANENTES CON EL PAPER
+================================================================================
+
+7.1 Isaac Gym expone solo fuerza neta de contacto (3D), no torque de contacto
+    El paper usa cfrc_ext de MuJoCo que tiene 6D (fuerza + torque de contacto).
+    Nuestro contact = 84 dims (28×3) vs paper 84 dims (14×6). Mismo número total
+    pero diferente información. NO hay forma de obtener torques de contacto de
+    net_contact_force_tensor en Isaac Gym → diferencia permanente.
+
+7.2 28 cuerpos vs 14 en el paper
+    H1-2 tiene 28 rigid bodies. MuJoCo Humanoid-v1 tiene 14.
+    Consecuencia: obs 607 dims vs 376, M shape 21×607 vs 17×376.
+    Policy H1-2: 12,747 params. Paper policy: 6,392 params.
+    La política lineal H1-2 tiene 2× más parámetros → necesita más muestras.
+
+7.3 Fórmula de update: dividimos por ν, el paper no
+    Ver §5.3 para análisis completo. Matemáticamente equivalente con α diferente.
+
+7.4 Clock signals (extra nuestro)
+    Añadimos 2 dims de fase de gait (sin/cos) que el paper no tiene.
+    Justificación: Humanoid-v1 de MuJoCo aprende gait emergente. H1-2 con
+    control a 50Hz tiene dinámica más compleja y las señales de clock ayudan
+    a sincronizar el ciclo de paso. Sin ellas, la política lineal tiene que
+    aprender el timing del gait implícitamente de las velocidades articulares.
+    NOTA: No está claro que aporten algo para una política LINEAL. Los clocks
+    son útiles en PPO donde la red puede aprender funciones periódicas no
+    lineales de ellos. Una política lineal solo puede calcular combinaciones
+    lineales de sin(phase), que son limitadas. Candidato a eliminar en v2.
+
+7.5 Velocidad comandada no está en obs
+    El paper sampea vx y el agente lo ve directamente (está en qvel[0]).
+    Nosotros: el agente NO ve vx comandada. Ve vx actual (base_lin_vel explicito).
+    El agente aprende: "si voy lento, aplico más torque en la dirección forward".
+    Efectivamente es una política de velocidad reactiva, no de seguimiento.
+    En la práctica es casi equivalente para este task (vx fijo objetivo).
+
+7.6 MuJoCo vs Isaac Gym
+    El paper usa MuJoCo (más preciso en contacto, paso variable, integración
+    simpléctica). Isaac Gym usa PhysX (más rápido, menos preciso en contacto,
+    paso fijo). La dinámica de contacto difiere, especialmente en los pies.
+    Isaac Gym es ~100× más rápido por paso para muchos entornos paralelos.
+
+
+8. ARQUITECTURA DE ARCHIVOS
+================================================================================
+
+/home/utec/HugWBC/
+├── legged_gym/envs/h1_2/
+│   ├── h1_2_walk.py           # H1_2WalkRobot: env principal (ver §3, §4)
+│   └── h1_2_walk_config.py    # H1_2WalkCfg, H1_2WalkCfgPPO
+├── legged_gym/scripts/
+│   └── train_walk.py          # Punto de entrada: --algo [ppo|ars]
+├── rsl_rl/rsl_rl/
+│   ├── algorithms/ars.py      # LinearPolicy + RunningMeanStd (Welford)
+│   └── runners/ars_runner.py  # ARSRunner: rollout paralelo + logging
+
+
+9. CÓMO LANZAR EL ENTRENAMIENTO
+================================================================================
+
+ARS (460 envs = 2 × 230 pares):
+  cd /home/utec/HugWBC
+  conda run -n hugwbc python legged_gym/scripts/train_walk.py \
+    --task h1_2walk --algo ars --num_envs 460 --headless
+
+PPO (para comparación):
+  conda run -n hugwbc python legged_gym/scripts/train_walk.py \
+    --task h1_2walk --algo ppo --num_envs 4096 --headless
+
+TensorBoard:
+  conda run -n hugwbc tensorboard --logdir logs/h1_2_walk_ars/
+
+Métricas clave ARS:
+  ARS/mean_episode_length  → objetivo: crecer hasta 1000 (episodio completo)
+  ARS/fall_rate            → objetivo: bajar hacia 0% (robot no cae)
+  ARS/estimated_vx         → estimación de velocidad forward (proxy de reward)
+  ARS/gradient_signal      → |r+ - r-| medio: debe crecer cuando hay aprendizaje
+  ARS/policy_norm          → ||M||_F: debe saturar, no crecer indefinidamente
+  ARS/sigma_r_raw          → std de rewards elite: bajo al inicio, sube al aprender
+  ARS/effective_lr         → α/(σ_r × ν): debe bajar conforme σ_r sube
+
+
+10. CRONOLOGÍA DE DECISIONES
+================================================================================
+
+Sesión Junio 2026 — decisiones en orden cronológico:
+
+1. Diseño inicial: obs 69 dims (con actions), M=(21,69)=1449 params
+   → Muy pocas dims; sin cinert; ep_len nunca subió de 56
+
+2. Análisis vs paper → faltaba cinert (140 dims en paper, 280 en H1-2)
+   → Implementamos cinert con rotación local→world: R @ I_local @ R^T
+
+3. Eliminamos actions del obs (paper no las tiene)
+   → WALK_PROP_DIM 69 → 48
+
+4. BUG cinert encontrado: raw physical units overwhelm obs_rms cold-start
+   → ep_len 56→30 en 23 iters (DECLINING)
+   → gradient signal ≈ 0 (r+ ≈ r-)
+   → FIX: _cinert_scale (masa/10, inercia/0.1)
+
+5. Añadimos base_lin_vel y root_height explícitos (+4 dims)
+   → WALK_PROP_DIM 48 → 52
+
+6. Añadimos contact_cost en reward (-0.001 × sum(clip(F/100,-1,1)²))
+   → Matchea el cfrc_ext penalty del paper
+
+Estado obs en cada iteración de diseño:
+  v0: 69  dims (con actions, sin cinert)
+  v1: 48  dims (sin actions, sin cinert)
+  v2: 336 dims (sin actions, con cinert sin normalizar → FALLABA)
+  v3: 607 dims (con cinert normalizado, con lin_vel+height explícitos)
+
+
+11. ANÁLISIS CRÍTICO: PUEDE ARS CONVERGER?
+================================================================================
+
+Razones para el optimismo:
+  - El paper demostró que ARS supera PPO en 3 de 6 tareas de MuJoCo (no en Humanoid)
+  - La tarea h1_2walk es MÁS SIMPLE que h1_2int (sin brazos, sin terreno complejo)
+  - Con 460 entornos paralelos y episodios de 1000 pasos, cada iteración
+    acumula 460,000 env-steps → señal razonablemente rica
+  - sigma_r_min=1.0 + max_norm=10.0 previenen los dos modos de fallo conocidos
+
+Razones para el escepticismo:
+  - Para Humanoid-v1 de MuJoCo, el paper NO logra que ARS supere PPO
+    (Tabla 1 del paper: Humanoid es la tarea donde ARS queda más atrás)
+  - H1-2 (21 DOF controlados) vs Humanoid-v1 (17 DOF): más complejo
+  - Política lineal: no puede representar funciones periódicas, condiciones,
+    ni comportamientos que dependan de productos de obs (no lineales)
+  - M tiene 12,747 params vs 6,392 del paper → más difícil de optimizar con
+    búsqueda aleatoria en dimensión alta
+  - El h1_2walk usa TORQUE DIRECTO (no PD). El paper usa actuadores PD internos.
+    Con torque directo, la política tiene que aprender implícitamente la dinámica
+    del PD loop → espacio de soluciones más difícil para una política lineal
+
+Predicción: ARS probablemente aprende a caminar un poco (ep_len > 200, fall_rate < 50%),
+pero es poco probable que alcance la calidad de PPO en el mismo número de iteraciones
+de reloj. El experimento tiene valor científico para documentar exactamente cuánto
+más eficiente es PPO en este dominio específico.
+
+Señales de que va bien (por iter):
+  Iter 100-200: ep_len debe subir de ~50 a ~150+, fall_rate debe bajar < 80%
+  Iter 500:     ep_len > 300, gradient_signal creciendo, estimated_vx > 0.3 m/s
+  Iter 1000:    ep_len > 500, fall_rate < 30%, estimated_vx > 0.8 m/s
+  Iter 3000:    ep_len > 700, estimated_vx > 1.2 m/s (si converge)
+
+Señales de colapso:
+  ep_len DECLINA (no solo plateau) después de iter 100
+  gradient_signal estancado en < 0.5 hasta iter 200
+  policy_norm creciendo sin bound (sin mejorar ep_len)
+
+
+12. MÉTRICAS PARA EL PAPER COMPARATIVO
+================================================================================
+
+Para comparar ARS vs PPO en el paper, las métricas equivalentes son:
+
+ARS → PPO equivalente:
+  ARS/mean_episode_length         → Train/mean_episode_length
+  ARS/fall_rate (= 1-survival)    → Train/rew_termination (negativo → más caídas)
+  ARS/estimated_vx                → Train/rew_tracking_lin_vel (normalizado)
+  ARS/policy_norm                 → no equiv. directo en PPO
+  ARS/sigma_r_raw                 → anáogo a value_function_loss (diversidad)
+  ARS/gradient_signal             → anáogo a surrogate_loss
+
+Eficiencia comparativa (unidad: millones de env-steps):
+  ARS: 460,000 env-steps/iter × 3000 iters = 1,380 millones
+  PPO: 98,304 env-steps/iter × 3000 iters = 294 millones
+  → PPO usa 4.7× menos datos para el mismo número de iteraciones
+
+La comparación justa es por env-steps totales (eje x), no por iteraciones.
+
+
+================================================================================
+FIN DEL DOCUMENTO
+================================================================================

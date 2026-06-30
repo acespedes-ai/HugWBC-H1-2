@@ -1,28 +1,25 @@
 from legged_gym.envs.h1_2.h1_2_config import H1_2Cfg, H1_2CfgPPO
 
 # H1-2 with arms (no wrists): legs×12 + torso×1 + shoulders+elbows×8 = 21 DOF controlled.
-# Wrists (6 DOF) fixed to default_dof_pos — no locomotion contribution.
-# Matches MuJoCo Humanoid (21 DOF) where arms are free for balance.
+# Observation matches Mania 2018 (ARS paper):
+#   prop(69) + torques(21) + contact_forces(num_bodies×3) + body_vels(num_bodies×6) + clock(2)
+# num_observations is a placeholder — overridden at runtime in H1_2WalkRobot._init_buffers
+# once Isaac Gym reports the actual num_bodies from the URDF.
 WALK_PROP_DIM = 69   # 3(ang_vel) + 3(gravity) + 21(dof_pos) + 21(dof_vel) + 21(actions)
-WALK_CMD_DIM  = 3    # vx, vy, yaw exposed in obs
 WALK_CLOCK    = 2
-WALK_NUM_OBS  = WALK_PROP_DIM + WALK_CMD_DIM + WALK_CLOCK   # 74
+WALK_NUM_OBS  = 1    # placeholder — overridden at runtime
 WALK_NUM_ACT  = 21   # legs (12) + torso (1) + shoulders+elbows (4×2)
 
 
 class H1_2WalkCfg(H1_2Cfg):
 
     class init_state(H1_2Cfg.init_state):
-        # Kinematic height with default pose (hip_pitch=-0.1, knee=0.3, ankle=-0.2): ~0.855m.
-        # MuJoCo Humanoid (ARS paper) starts with feet on ground, no drop.
-        # Setting pos[2]=0.86 ≈ kinematic height eliminates the 0.115m drop/bounce
-        # that was capping ep_len at ~53 regardless of policy quality.
-        pos = [0.0, 0.0, 1.05]  # official Unitree value; kinematic height with -0.16/0.36/-0.20 ≈ 1.0m
+        pos = [0.0, 0.0, 1.05]  # official Unitree spawn height
 
     class env(H1_2Cfg.env):
         num_envs           = 4096
-        num_observations   = WALK_NUM_OBS
-        num_partial_obs    = WALK_NUM_OBS
+        num_observations   = WALK_NUM_OBS  # overridden at runtime
+        num_partial_obs    = WALK_NUM_OBS  # overridden at runtime
         num_privileged_obs = None
         num_actions        = WALK_NUM_ACT
         has_privileged_info    = False
@@ -60,12 +57,13 @@ class H1_2WalkCfg(H1_2Cfg):
         reward_curriculum_list = []
 
         class scales(H1_2Cfg.rewards.scales):
-            # === Paper-identical reward (Mania et al. 2018) ===
-            # R = forward_vel + 5*alive - 0.001*||u||²
-            forward_vel       =  1.0   # raw signed vx (m/s)
-            alive             =  5.0   # essential with torque control: robot falls with zero actions
-            control_cost      = -0.001 # paper ctrl_cost coefficient (fn returns sum of a²)
-            termination       =  0.0   # no extra spike; episode ends via check_termination
+            # === Paper-matching reward (Mania et al. 2018) ===
+            # R = forward_vel + 5*alive - ctrl_cost - contact_cost
+            forward_vel       =  1.0    # raw signed vx (m/s)
+            alive             =  5.0    # essential with torque control: robot falls with zero actions
+            control_cost      = -0.001  # paper: 0.5e-3*sum(a²); fn returns sum(a²), scale≈same
+            contact_cost      = -0.001  # paper: 0.5e-3*sum(clip(cfrc_ext,-1,1)²); fn clips at 100N
+            termination       =  0.0    # no extra spike; episode ends via check_termination
             # === everything else disabled ===
             tracking_lin_vel  =  0
             tracking_ang_vel  =  0
@@ -116,7 +114,7 @@ class H1_2WalkCfgPPO(H1_2CfgPPO):
                 hidden_dims = [512, 256, 128]
 
         critic_hidden_dims = [512, 256, 128]
-        critic_obs_dim     = WALK_NUM_OBS
+        critic_obs_dim     = WALK_NUM_OBS  # overridden at runtime
 
 
 class H1_2WalkCfgARS:

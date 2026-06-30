@@ -90,6 +90,16 @@ class ARSRunner:
             if self.log_dir:
                 sigma_r_min = getattr(self.cfg, 'sigma_r_min', 1.0)
                 eff_lr = self.alpha / (max(sigma_r_raw, sigma_r_min) * self.nu)
+                # Derived diagnostics (like reward components in PPO):
+                # total ≈ alive(0.1*ep_len) + forward(0.02*vx*ep_len) + control_cost
+                # → estimated_vx = (total - 0.1*ep_len) / (0.02*ep_len)
+                estimated_vx = (mean_rew - 0.1 * mean_len) / (0.02 * max(mean_len, 1))
+                # fall_rate: fraction of envs that didn't reach max_steps
+                all_ep_lens = torch.cat([rewards_pos.new_zeros(0), ep_lens])
+                fall_rate = (ep_lens < self.max_steps).float().mean().item()
+                # gradient signal: how much do perturbations change the reward
+                grad_signal = abs(rewards_pos.mean().item() - rewards_neg.mean().item())
+
                 self.writer.add_scalar('ARS/mean_episode_reward', mean_rew, it)
                 self.writer.add_scalar('ARS/mean_episode_length', mean_len, it)
                 self.writer.add_scalar('ARS/rewards_pos_mean', rewards_pos.mean().item(), it)
@@ -97,12 +107,15 @@ class ARSRunner:
                 self.writer.add_scalar('ARS/policy_norm', self.policy.M.norm().item(), it)
                 self.writer.add_scalar('ARS/sigma_r_raw', sigma_r_raw, it)
                 self.writer.add_scalar('ARS/effective_lr', eff_lr, it)
+                self.writer.add_scalar('ARS/estimated_vx', estimated_vx, it)
+                self.writer.add_scalar('ARS/fall_rate', fall_rate, it)
+                self.writer.add_scalar('ARS/gradient_signal', grad_signal, it)
                 self.writer.add_scalar('Perf/rollout_time', rollout_time, it)
                 self.writer.add_scalar('Perf/update_time',  update_time,  it)
 
             print(f"[ARS] iter {it:5d}  rew={mean_rew:7.2f}  ep_len={mean_len:6.1f}  "
-                  f"r+={rewards_pos.mean():6.2f}  r-={rewards_neg.mean():6.2f}  "
-                  f"||M||={self.policy.M.norm():.3f}  "
+                  f"vx≈{estimated_vx:+.2f}m/s  fall={fall_rate*100:.0f}%  "
+                  f"||M||={self.policy.M.norm():.3f}  σr={sigma_r_raw:.1f}  "
                   f"[rollout {rollout_time:.1f}s | update {update_time:.2f}s]")
 
             if it % self.save_interval == 0 and self.log_dir:
