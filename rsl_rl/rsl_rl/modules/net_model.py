@@ -100,7 +100,31 @@ class BaseAdaptModel(nn.Module):
         if self.privileged_recon_loss != 0:
             metrics['privileged_recon_loss'] += self.privileged_recon_loss.item()
         return self.privileged_recon_loss
-    
+
+
+class SimpleMlpModel(nn.Module):
+    """Plain MLP actor — no history, no teacher-student. Used for walk comparison tasks."""
+    is_recurrent = False
+
+    def __init__(self, obs_dim, act_dim,
+                 hidden_dims=(512, 256, 128),
+                 activation='elu',
+                 output_activation=None,
+                 **kwargs):
+        super().__init__()
+        self.is_recurrent = False
+        self.privileged_recon_loss = 0
+        layers = MLP(obs_dim, act_dim, list(hidden_dims), activation, output_activation)
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x, **kwargs):
+        if x.dim() == 3:
+            x = x[:, -1, :]
+        return self.net(x)
+
+    def compute_adaptation_pred_loss(self, metrics):
+        return 0
+
 class MlpAdaptModel(BaseAdaptModel):
     def __init__(self,
                  obs_dim,

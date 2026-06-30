@@ -1,0 +1,22 @@
+# Logs and training outputs
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Misc
+resources/ankle.mhtml

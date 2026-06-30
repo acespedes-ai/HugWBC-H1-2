@@ -88,6 +88,80 @@ class PPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
+        self._build_symmetry_matrices()
+
+    def _build_symmetry_matrices(self):
+        if self.robot_type == 'h1_2':
+            # H1-2 DOF order (27): l_hip_yaw/pitch/roll, l_knee, l_ankle_pitch/roll,
+            #   r_hip_yaw/pitch/roll, r_knee, r_ankle_pitch/roll, torso,
+            #   l_sh_pitch/roll/yaw, l_elbow, l_wr_roll/pitch/yaw,
+            #   r_sh_pitch/roll/yaw, r_elbow, r_wr_roll/pitch/yaw
+            # Option B: 21 actions (12 legs + 1 torso + 4 left arm + 4 right arm, no wrists)
+            # Action order: l_hip_yaw/pitch/roll, l_knee, l_ankle_pitch/roll (0-5)
+            #               r_hip_yaw/pitch/roll, r_knee, r_ankle_pitch/roll (6-11)
+            #               torso (12)
+            #               l_sh_pitch/roll/yaw, l_elbow (13-16)
+            #               r_sh_pitch/roll/yaw, r_elbow (17-20)
+            actions_permutation = torch.tensor([
+                -6,  7, -8,  9, 10, -11,          # left leg (0-5)   → right leg
+                -0.001, 1, -2,  3,  4,  -5,        # right leg (6-11) → left leg
+                -12,                                # torso (12)       → torso (negated)
+                17, -18, -19, 20,                   # left arm (13-16) → right arm
+                13, -14, -15, 16,                   # right arm (17-20)→ left arm
+            ])
+            # Option B partial_obs = 81 + 11 + 2 = 94 dims
+            # Layout: ang_vel(3) gravity(3) dof_pos(27) dof_vel(27) actions(21) cmds(11) clock(2)
+            observations_permutation = torch.tensor([
+                # [0:6] ang_vel + gravity
+                -0.0001, 1, -2, 3, -4, 5,
+                # [6:33] dof_pos  (obs_idx = 6 + dof_idx) — all 27 DOFs still observed
+                -12, 13, -14, 15, 16, -17,
+                -6, 7, -8, 9, 10, -11,
+                -18,
+                26, -27, -28, 29, -30, 31, -32,
+                19, -20, -21, 22, -23, 24, -25,
+                # [33:60] dof_vel (obs_idx = 33 + dof_idx) — all 27 DOFs still observed
+                -39, 40, -41, 42, 43, -44,
+                -33, 34, -35, 36, 37, -38,
+                -45,
+                53, -54, -55, 56, -57, 58, -59,
+                46, -47, -48, 49, -50, 51, -52,
+                # [60:81] actions (obs_idx = 60 + action_idx, 21 non-wrist DOFs)
+                -66, 67, -68, 69, 70, -71,          # left leg (act 0-5)
+                -60, 61, -62, 63, 64, -65,           # right leg (act 6-11)
+                -72,                                  # torso (act 12)
+                77, -78, -79, 80,                     # left arm (act 13-16) → right arm
+                73, -74, -75, 76,                     # right arm (act 17-20) → left arm
+                # [81:92] commands (11): vx, vy, yaw, freq, phase, dur, swing_h, body_h, pitch, waist, interrupt
+                81, -82, -83, 84, 85, 86, 87, 88, 89, -90, 91,
+                # [92:94] clock: left_foot, right_foot → swap
+                93, 92,
+            ])
+        else:
+            # H1 DOF order (19): l_hip_yaw/roll/pitch, l_knee, l_ankle,
+            #   r_hip_yaw/roll/pitch, r_knee, r_ankle, torso,
+            #   l_sh_pitch/roll/yaw, l_elbow, r_sh_pitch/roll/yaw, r_elbow
+            actions_permutation = torch.tensor([
+                -5, -6, 7, 8, 9, -0.001, -1, 2, 3, 4, -10,
+                15, -16, -17, 18, 11, -12, -13, 14,
+            ])
+            # H1int partial_obs = 63 + 11 + 2 = 76 dims
+            observations_permutation = torch.tensor([
+                -0.0001, 1, -2, 3, -4, 5,
+                -11, -12, 13, 14, 15, -6, -7, 8, 9, 10, -16, 21, -22, -23, 24, 17, -18, -19, 20,
+                -30, -31, 32, 33, 34, -25, 26, 27, 28, 29, -35, 40, -41, -42, 43, 36, -37, -38, 39,
+                -49, -50, 51, 52, 53, -44, -45, 46, 47, 48, -54, 59, -60, -61, 62, 55, -56, -57, 58,
+                63, -64, -65, 66, 67, 68, 69, 70, 71, -72, 73, 75, 74,
+            ])
+
+        n_act = len(actions_permutation)
+        n_obs = len(observations_permutation)
+        self.act_perm_mat = torch.zeros(n_act, n_act, requires_grad=False, device=self.device)
+        self.obs_perm_mat = torch.zeros(n_obs, n_obs, requires_grad=False, device=self.device)
+        for i, perm in enumerate(actions_permutation):
+            self.act_perm_mat[i][int(torch.abs(perm))] = torch.sign(perm)
+        for i, perm in enumerate(observations_permutation):
+            self.obs_perm_mat[i][int(torch.abs(perm))] = torch.sign(perm)
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
         self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device)
@@ -183,25 +257,14 @@ class PPO:
                 if self.sync_update:
                     adaptation_loss = self.actor_critic.actor.compute_adaptation_pred_loss(metrics)
 
-                # symmetry loss 
-                actions_permutation = torch.tensor([-5, -6, 7, 8, 9, -0.001, -1, 2, 3, 4, -10, 15, -16, -17, 18, 11, -12, -13, 14])
-                observations_permutation = torch.tensor([-0.0001, 1, -2, 3, -4, 5,
-                                                        -11, -12, 13, 14, 15, -6, -7, 8, 9, 10, -16, 21, -22, -23, 24, 17, -18, -19, 20,
-                                                        -30, -31, 32, 33, 34, -25, 26, 27, 28, 29, -35, 40, -41, -42, 43, 36, -37, -38, 39,
-                                                        -49, -50, 51, 52, 53, -44, -45, 46, 47, 48, -54, 59, -60, -61, 62, 55, -56, -57, 58,
-                                                        63, -64, -65, 66, 67, 68, 69, 70, 71, -72, 73, 75, 74
-                                                        ])
-                    
-                act_perm_mat = torch.zeros(len(actions_permutation), len(actions_permutation), requires_grad=False, device=self.device)
-                obs_perm_mat = torch.zeros(len(observations_permutation), len(observations_permutation), requires_grad=False, device=self.device)
-                for i, perm in enumerate(actions_permutation):
-                    act_perm_mat[i][int(torch.abs(perm))] = torch.sign(perm)
-                for i, perm in enumerate(observations_permutation):
-                    obs_perm_mat[i][int(torch.abs(perm))] = torch.sign(perm)
+                # symmetry loss — matrices built once in __init__ via _build_symmetry_matrices()
+                act_perm_mat = self.act_perm_mat
+                obs_perm_mat = self.obs_perm_mat
 
                 origin_act, _ = self.actor_critic.act_inference(obs_batch, masks=masks_batch, privileged_obs=critic_obs_batch)
-                mirror_partial_obs_batch = torch.matmul(obs_batch[..., :len(observations_permutation)], obs_perm_mat)
-                mirror_obs_batch = torch.cat((mirror_partial_obs_batch, obs_batch[..., len(observations_permutation):]), dim=-1)
+                n_obs_perm = obs_perm_mat.shape[0]
+                mirror_partial_obs_batch = torch.matmul(obs_batch[..., :n_obs_perm], obs_perm_mat)
+                mirror_obs_batch = torch.cat((mirror_partial_obs_batch, obs_batch[..., n_obs_perm:]), dim=-1)
                 mirror_act, _ = self.actor_critic.act_inference(mirror_obs_batch, masks=masks_batch, privileged_obs=critic_obs_batch)
                 recovery_act = torch.matmul(mirror_act, act_perm_mat)
 

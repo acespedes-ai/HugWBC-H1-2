@@ -4,7 +4,7 @@ sys.path.append(os.getcwd())
 from legged_gym import LEGGED_GYM_ROOT_DIR
 import isaacgym
 from legged_gym.envs import *
-from legged_gym.utils import get_args, task_registry, update_class_from_dict, export_policy_as_jit
+from legged_gym.utils import get_args, task_registry, update_class_from_dict
 from isaacgym import gymapi
 import numpy as np
 import torch
@@ -107,8 +107,8 @@ def play(args):
             env.disturb_isnoise[:]= True
             env.disturb_rad_curriculum[:] = 1.0
             env.interrupt_mask[:] = env.disturb_masks[:]
-            env.standing_envs_mask[:] = True
-            env.commands[env.standing_envs_mask, :3] = 0
+            #env.standing_envs_mask[:] = True  # descomentar para que se quede quieto
+            #env.commands[env.standing_envs_mask, :3] = 0  #descomentar para que se quede quieto.
 
 if __name__ == '__main__':
     args = get_args()
