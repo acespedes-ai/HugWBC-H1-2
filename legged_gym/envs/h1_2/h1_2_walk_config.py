@@ -48,14 +48,13 @@ class H1_2WalkCfg(H1_2Cfg):
     class domain_rand(H1_2Cfg.domain_rand):
         # Paper (Mania 2018) trains in simulation without any domain randomization.
         # All randomization disabled for fair comparison.
-        push_robots                = False
-        randomize_gains            = False
-        randomize_control_latency  = False
-        randomize_link_inertia     = False
-        randomize_link_mass        = False
-        randomize_link_com         = False
-        randomize_motor_strength   = False
-        randomize_friction         = False
+        push_robots               = False
+        randomize_friction        = False
+        randomize_gains           = False
+        randomize_control_latency = False
+        randomize_link_props      = False  # inertia + mass + COM (h1.py:502)
+        randomize_base_mass       = False
+        randomize_motor_offset    = False
 
     class rewards(H1_2Cfg.rewards):
         penalize_curriculum    = False
