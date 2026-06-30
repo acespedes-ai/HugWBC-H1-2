@@ -46,11 +46,16 @@ class H1_2WalkCfg(H1_2Cfg):
             ang_vel_yaw = [-1.0, 1.0]
 
     class domain_rand(H1_2Cfg.domain_rand):
-        push_robots                = False  # pushes add noise to ARS gradient; paper didn't use them
-        push_interval_s            = 15
-        max_push_vel_xy            = 0.5
+        # Paper (Mania 2018) trains in simulation without any domain randomization.
+        # All randomization disabled for fair comparison.
+        push_robots                = False
         randomize_gains            = False
-        randomize_control_latency  = False  # obs es 50-dim, buffer de latencia espera 60 (6+27*2)
+        randomize_control_latency  = False
+        randomize_link_inertia     = False
+        randomize_link_mass        = False
+        randomize_link_com         = False
+        randomize_motor_strength   = False
+        randomize_friction         = False
 
     class rewards(H1_2Cfg.rewards):
         penalize_curriculum    = False
